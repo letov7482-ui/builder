@@ -1,0 +1,685 @@
+name: PAK Unpacker
+
+on:
+  workflow_dispatch:
+    inputs:
+      pak_file:
+        description: 'Имя PAK файла в корне репозитория'
+        required: true
+        default: 'original.pak'
+      aes_key:
+        description: 'AES ключ (hex, если зашифрован). Оставь пустым если не знаешь'
+        required: false
+        default: ''
+
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install pycryptodome lz4 zstandard
+
+      - name: Check PAK file exists
+        run: |
+          PAK_FILE="${{ github.event.inputs.pak_file }}"
+          if [ ! -f "$PAK_FILE" ]; then
+            echo "[-] File not found: $PAK_FILE"
+            echo ""
+            echo "Files in repo:"
+            find . -name "*.pak" -o -name "*.PAK" -o -name "*.Pak"
+            echo ""
+            echo "All root files:"
+            ls -la
+            exit 1
+          fi
+          echo "[+] Found: $PAK_FILE"
+          ls -lh "$PAK_FILE"
+          file "$PAK_FILE"
+
+      - name: Hex dump footer (diagnostic)
+        run: |
+          PAK_FILE="${{ github.event.inputs.pak_file }}"
+          echo "=== Last 128 bytes ==="
+          xxd -l 128 -s -128 "$PAK_FILE"
+          echo ""
+          echo "=== First 128 bytes ==="
+          xxd -l 128 "$PAK_FILE"
+          echo ""
+          echo "=== Searching for PAK magic (5A6F12E1) ==="
+          xxd "$PAK_FILE" | grep -i "e112 6f5a" || echo "Magic not found in plain hex dump"
+
+      - name: Create unpacker script
+        run: |
+          cat > pak_tool.py << 'PYEOF'
+          #!/usr/bin/env python3
+          """
+          PAK Unpacker for UE4 mobile games
+          Supports versions 1-11, AES decryption, multiple compression formats
+          """
+          import struct
+          import os
+          import sys
+          import zlib
+          import hashlib
+          import json
+
+          MAGIC = 0x5A6F12E1
+
+          COMPRESSION_NAMES = {
+              0: 'None',
+              1: 'Zlib',
+              2: 'Gzip',
+              3: 'Oodle',
+              4: 'LZ4',
+              5: 'ZSTD',
+          }
+
+          def find_footer(pak_path):
+              """Ищет PAK footer в конце файла"""
+              file_size = os.path.getsize(pak_path)
+
+              with open(pak_path, 'rb') as f:
+                  # UE4 footer sizes для разных версий
+                  # v1-v3: 44 bytes, v4+: больше
+                  for footer_size in [44, 45, 53, 57, 61, 65, 221]:
+                      if footer_size > file_size:
+                          continue
+
+                      f.seek(file_size - footer_size)
+                      footer_data = f.read(footer_size)
+
+                      # ищем magic внутри footer
+                      for magic_off in range(len(footer_data) - 3):
+                          magic = struct.unpack_from('<I', footer_data, magic_off)[0]
+                          if magic == MAGIC:
+                              print(f"[+] Found magic at offset -{footer_size - magic_off} from end")
+                              print(f"[*] Footer size: {footer_size}")
+                              return footer_data, magic_off, footer_size
+
+                  # если не нашли — сканируем последние 4KB
+                  scan_size = min(4096, file_size)
+                  f.seek(file_size - scan_size)
+                  tail = f.read(scan_size)
+
+                  for i in range(len(tail) - 3, -1, -1):
+                      magic = struct.unpack_from('<I', tail, i)[0]
+                      if magic == MAGIC:
+                          print(f"[+] Found magic scanning tail at offset {i}")
+                          # определяем размер footer от magic до конца
+                          footer_from_magic = tail[i:]
+                          return footer_from_magic, 0, len(footer_from_magic)
+
+              return None, None, None
+
+          def parse_footer(footer_data, magic_offset):
+              """Парсит footer"""
+              base = magic_offset
+
+              version = struct.unpack_from('<i', footer_data, base + 4)[0]
+              index_offset = struct.unpack_from('<q', footer_data, base + 8)[0]
+              index_size = struct.unpack_from('<q', footer_data, base + 16)[0]
+              index_hash = footer_data[base + 24:base + 44]
+
+              # v8+ имеет encrypted flag
+              encrypted_index = 0
+              if version >= 7:
+                  if base + 44 < len(footer_data):
+                      encrypted_index = struct.unpack_from('<I', footer_data, base + 44)[0]
+
+              print(f"[+] PAK Version: {version}")
+              print(f"[+] Index Offset: {index_offset} (0x{index_offset:X})")
+              print(f"[+] Index Size: {index_size} bytes")
+              print(f"[+] Index Hash: {index_hash.hex()}")
+              if version >= 7:
+                  print(f"[+] Index Encrypted: {'Yes' if encrypted_index else 'No'}")
+
+              return version, index_offset, index_size, encrypted_index
+
+          def decrypt_aes_ecb(data, key_hex):
+              """AES-256-ECB расшифровка"""
+              from Crypto.Cipher import AES
+
+              key = bytes.fromhex(key_hex)
+              if len(key) != 32:
+                  print(f"[-] Key must be 32 bytes (64 hex chars), got {len(key)}")
+                  return data
+
+              cipher = AES.new(key, AES.MODE_ECB)
+
+              # AES работает блоками по 16 байт
+              pad_len = (16 - len(data) % 16) % 16
+              padded = data + b'\x00' * pad_len
+              decrypted = cipher.decrypt(padded)
+
+              return decrypted[:len(data)]
+
+          def decompress_data(data, method, uncomp_size=0):
+              """Распаковка"""
+              try:
+                  if method == 0:
+                      return data
+                  elif method == 1:
+                      return zlib.decompress(data)
+                  elif method == 2:
+                      import gzip
+                      return gzip.decompress(data)
+                  elif method == 4:
+                      import lz4.block
+                      # пробуем с известным размером
+                      if uncomp_size > 0:
+                          try:
+                              return lz4.block.decompress(data, uncompressed_size=uncomp_size)
+                          except:
+                              pass
+                      return lz4.block.decompress(data, uncompressed_size=len(data) * 20)
+                  elif method == 5:
+                      import zstandard
+                      return zstandard.ZstdDecompressor().decompress(data)
+                  else:
+                      print(f"[-] Unsupported compression: {method}")
+                      return None
+              except Exception as e:
+                  print(f"[-] Decompress error: {e}")
+                  return None
+
+          def parse_index_v1(data):
+              """Парсинг индекса v1-v7"""
+              offset = 0
+
+              # mount point
+              mount_len = struct.unpack_from('<i', data, offset)[0]
+              offset += 4
+              mount_point = data[offset:offset + mount_len].decode('utf-8', errors='replace').rstrip('\x00')
+              offset += mount_len
+
+              # число записей
+              num_entries = struct.unpack_from('<i', data, offset)[0]
+              offset += 4
+
+              print(f"[+] Mount point: {mount_point}")
+              print(f"[+] Entries: {num_entries}")
+
+              entries = {}
+              errors = 0
+
+              for i in range(num_entries):
+                  try:
+                      # имя файла
+                      name_len = struct.unpack_from('<i', data, offset)[0]
+                      offset += 4
+                      if name_len <= 0 or name_len > 1024:
+                          print(f"[-] Invalid name length {name_len} at entry {i}")
+                          errors += 1
+                          break
+                      filename = data[offset:offset + name_len].decode('utf-8', errors='replace').rstrip('\x00')
+                      offset += name_len
+
+                      # данные записи
+                      entry_offset = struct.unpack_from('<q', data, offset)[0]
+                      entry_comp = struct.unpack_from('<q', data, offset + 8)[0]
+                      entry_uncomp = struct.unpack_from('<q', data, offset + 16)[0]
+                      compression = struct.unpack_from('<i', data, offset + 24)[0]
+                      offset += 28
+
+                      # hash (20 байт SHA-1)
+                      entry_hash = data[offset:offset + 20]
+                      offset += 20
+
+                      # v3+ имеет блоки сжатия
+                      blocks = []
+                      if compression > 0 and version_supports_blocks(current_version):
+                          num_blocks = struct.unpack_from('<I', data, offset)[0]
+                          offset += 4
+                          for b in range(num_blocks):
+                              block_off = struct.unpack_from('<q', data, offset)[0]
+                              block_comp = struct.unpack_from('<q', data, offset + 8)[0]
+                              block_uncomp = struct.unpack_from('<q', data, offset + 16)[0]
+                              offset += 24
+                              blocks.append({
+                                  'offset': block_off,
+                                  'comp': block_comp,
+                                  'uncomp': block_uncomp
+                              })
+
+                      entries[filename] = {
+                          'offset': entry_offset,
+                          'comp_size': entry_comp,
+                          'uncomp_size': entry_uncomp,
+                          'compression': compression,
+                          'hash': entry_hash.hex(),
+                          'blocks': blocks
+                      }
+
+                  except Exception as e:
+                      print(f"[-] Entry {i} parse error: {e}")
+                      errors += 1
+                      if errors > 10:
+                          break
+                      continue
+
+              return entries
+
+          current_version = 3
+
+          def version_supports_blocks(ver):
+              return ver >= 3
+
+          def parse_index_v8(data):
+              """Парсинг индекса v8+ (encoded pak format)"""
+              offset = 0
+
+              # mount point
+              mount_len = struct.unpack_from('<i', data, offset)[0]
+              offset += 4
+              mount_point = data[offset:offset + mount_len].decode('utf-8', errors='replace').rstrip('\x00')
+              offset += mount_len
+
+              # число записей
+              num_entries = struct.unpack_from('<i', data, offset)[0]
+              offset += 4
+
+              # path hash seed
+              path_hash_seed = struct.unpack_from('<I', data, offset)[0]
+              offset += 4
+
+              # has path hash index
+              has_path_hash = struct.unpack_from('<I', data, offset)[0]
+              offset += 4
+
+              print(f"[+] Mount point: {mount_point}")
+              print(f"[+] Entries: {num_entries}")
+              print(f"[+] Path hash seed: 0x{path_hash_seed:08X}")
+
+              # пропускаем path hash index если есть
+              if has_path_hash:
+                  ph_offset = struct.unpack_from('<q', data, offset)[0]
+                  ph_size = struct.unpack_from('<q', data, offset + 8)[0]
+                  offset += 16 + 20  # offset + size + hash
+                  print(f"[*] Path hash index at {ph_offset}, size {ph_size} (skipping in memory)")
+                  offset += ph_size
+
+              # encoded pak entries
+              has_full_index = struct.unpack_from('<I', data, offset)[0]
+              offset += 4
+
+              if has_full_index:
+                  fi_offset = struct.unpack_from('<q', data, offset)[0]
+                  fi_size = struct.unpack_from('<q', data, offset + 8)[0]
+                  fi_hash = data[offset + 16:offset + 36]
+                  offset += 36
+
+                  print(f"[+] Full index at {fi_offset}, size {fi_size}")
+
+                  # encoded entries
+                  enc_offset = struct.unpack_from('<q', data, offset)[0]
+                  enc_size = struct.unpack_from('<q', data, offset + 8)[0]
+                  enc_hash = data[offset + 16:offset + 36]
+                  offset += 36
+
+                  print(f"[+] Encoded entries at {enc_offset}, size {enc_size}")
+
+                  # читаем encoded entries
+                  if enc_size > 0 and enc_offset + enc_size <= len(data):
+                      return parse_encoded_entries(data[enc_offset:enc_offset + enc_size], num_entries)
+                  elif fi_size > 0 and fi_offset + fi_size <= len(data):
+                      return parse_full_index(data[fi_offset:fi_offset + fi_size], num_entries)
+
+              # fallback: пробуем парсить как v1
+              print("[*] Falling back to v1 parsing...")
+              return parse_index_v1(data)
+
+          def parse_encoded_entries(data, num_entries):
+              """Парсинг encoded pak entries"""
+              offset = 0
+              entries = {}
+
+              for i in range(num_entries):
+                  try:
+                      entry_offset = struct.unpack_from('<q', data, offset)[0]
+                      offset += 8
+
+                      uncomp_size = struct.unpack_from('<q', data, offset)[0]
+                      offset += 8
+
+                      compression = struct.unpack_from('<I', data, offset)[0]
+                      offset += 4
+
+                      encrypted = struct.unpack_from('<I', data, offset)[0]
+                      offset += 4
+
+                      comp_blocks_offset = struct.unpack_from('<q', data, offset)[0]
+                      comp_blocks_size = struct.unpack_from('<q', data, offset + 8)[0]
+                      offset += 20  # 8+8+4 (offset + size + hash)
+
+                      if compression == 0:
+                          comp_size = uncomp_size
+                      else:
+                          comp_size = comp_blocks_size
+
+                      entries[f"entry_{i}"] = {
+                          'offset': entry_offset,
+                          'comp_size': comp_size,
+                          'uncomp_size': uncomp_size,
+                          'compression': compression,
+                          'encrypted': encrypted,
+                          'blocks_offset': comp_blocks_offset,
+                          'blocks_size': comp_blocks_size
+                      }
+
+                      if i % 1000 == 0 and i > 0:
+                          print(f"  ... {i}/{num_entries}")
+
+                  except Exception as e:
+                      print(f"[-] Encoded entry {i}: {e}")
+                      break
+
+              return entries
+
+          def parse_full_index(data, num_entries):
+              """Парсинг полного индекса с именами"""
+              offset = 0
+              entries = {}
+
+              for i in range(num_entries):
+                  try:
+                      # имя
+                      name_len = struct.unpack_from('<i', data, offset)[0]
+                      offset += 4
+                      filename = data[offset:offset + name_len].decode('utf-8', errors='replace').rstrip('\x00')
+                      offset += name_len
+
+                      entry_offset = struct.unpack_from('<q', data, offset)[0]
+                      offset += 8
+
+                      uncomp_size = struct.unpack_from('<q', data, offset)[0]
+                      offset += 8
+
+                      compression = struct.unpack_from('<I', data, offset)[0]
+                      offset += 4
+
+                      encrypted = struct.unpack_from('<I', data, offset)[0]
+                      offset += 4
+
+                      comp_blocks_size = struct.unpack_from('<q', data, offset)[0]
+                      offset += 8
+                      offset += 20  # hash
+
+                      if compression == 0:
+                          comp_size = uncomp_size
+                      else:
+                          comp_size = comp_blocks_size
+
+                      entries[filename] = {
+                          'offset': entry_offset,
+                          'comp_size': comp_size,
+                          'uncomp_size': uncomp_size,
+                          'compression': compression,
+                          'encrypted': encrypted
+                      }
+
+                      if i % 1000 == 0 and i > 0:
+                          print(f"  ... {i}/{num_entries}")
+
+                  except Exception as e:
+                      print(f"[-] Full index entry {i}: {e}")
+                      break
+
+              return entries
+
+          def extract_all(pak_path, output_dir, aes_key=''):
+              """Полная распаковка"""
+              global current_version
+
+              file_size = os.path.getsize(pak_path)
+              print(f"[*] PAK file: {pak_path}")
+              print(f"[*] Size: {file_size} bytes ({file_size / 1024 / 1024:.1f} MB)")
+              print("=" * 60)
+
+              # находим footer
+              footer_data, magic_off, footer_size = find_footer(pak_path)
+              if footer_data is None:
+                  print("[-] PAK footer not found!")
+                  print("[*] File may be encrypted with custom encryption or non-standard format")
+                  print("[*] Dumping last 256 bytes for manual analysis:")
+                  with open(pak_path, 'rb') as f:
+                      f.seek(-256, 2)
+                      tail = f.read(256)
+                  for i in range(0, len(tail), 16):
+                      hex_str = ' '.join(f'{b:02X}' for b in tail[i:i + 16])
+                      ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in tail[i:i + 16])
+                      print(f"  {file_size - 256 + i:08X}: {hex_str}  {ascii_str}")
+                  return False
+
+              version, index_offset, index_size, encrypted = parse_footer(footer_data, magic_off)
+              current_version = version
+
+              # читаем индекс
+              print("=" * 60)
+              print("[*] Reading index...")
+              with open(pak_path, 'rb') as f:
+                  f.seek(index_offset)
+                  index_data = f.read(index_size)
+
+              # расшифровка
+              if aes_key:
+                  print("[*] Decrypting index with AES key...")
+                  index_data = decrypt_aes_ecb(index_data, aes_key)
+              elif encrypted:
+                  print("[!] Index is encrypted but no key provided!")
+                  print("[*] Trying to parse anyway (may fail)...")
+                  # дампим первые байты зашифрованного индекса для диагностики
+                  print(f"[*] First 64 bytes of encrypted index:")
+                  for i in range(0, min(64, len(index_data)), 16):
+                      hex_str = ' '.join(f'{b:02X}' for b in index_data[i:i + 16])
+                      print(f"  {i:04X}: {hex_str}")
+
+              # парсим индекс
+              if version >= 8:
+                  entries = parse_index_v8(index_data)
+              else:
+                  entries = parse_index_v1(index_data)
+
+              if not entries:
+                  print("[-] No entries parsed. Index may be encrypted.")
+                  print("[*] Try providing AES key")
+                  return False
+
+              print(f"[+] Parsed {len(entries)} entries")
+              print("=" * 60)
+
+              # распаковка
+              os.makedirs(output_dir, exist_ok=True)
+              extracted = 0
+              failed = 0
+              skipped = 0
+
+              with open(pak_path, 'rb') as f:
+                  for filename, entry in entries.items():
+                      try:
+                          # безопасный путь
+                          safe_name = filename.lstrip('/').replace('..', '_')
+                          filepath = os.path.join(output_dir, safe_name)
+                          filepath = os.path.normpath(filepath)
+
+                          # path traversal protection
+                          if not filepath.startswith(os.path.normpath(output_dir)):
+                              skipped += 1
+                              continue
+
+                          os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+                          # читаем данные
+                          f.seek(entry['offset'])
+                          raw = f.read(entry['comp_size'])
+
+                          # расшифровка файла если зашифрован
+                          if entry.get('encrypted') and aes_key:
+                              raw = decrypt_aes_ecb(raw, aes_key)
+
+                          # распаковка
+                          if entry['compression'] > 0:
+                              content = decompress_data(raw, entry['compression'], entry['uncomp_size'])
+                          else:
+                              content = raw
+
+                          if content is None:
+                              failed += 1
+                              continue
+
+                          with open(filepath, 'wb') as out:
+                              out.write(content)
+
+                          extracted += 1
+                          if extracted % 500 == 0:
+                              print(f"  Extracted {extracted}/{len(entries)}...")
+
+                      except Exception as e:
+                          print(f"[-] {filename}: {e}")
+                          failed += 1
+
+              print("=" * 60)
+              print(f"[+] Extracted: {extracted}")
+              print(f"[-] Failed: {failed}")
+              print(f"[!] Skipped: {skipped}")
+              print(f"[*] Output: {output_dir}/")
+
+              # сохраняем manifest
+              manifest = {
+                  'pak_file': pak_path,
+                  'pak_size': file_size,
+                  'version': version,
+                  'index_offset': index_offset,
+                  'index_size': index_size,
+                  'encrypted': bool(encrypted),
+                  'total_entries': len(entries),
+                  'extracted': extracted,
+                  'failed': failed,
+                  'entries': {
+                      name: {
+                          'offset': e['offset'],
+                          'size': e['uncomp_size'],
+                          'compression': COMPRESSION_NAMES.get(e['compression'], 'unknown')
+                      }
+                      for name, e in list(entries.items())[:5000]  # limit
+                  }
+              }
+
+              with open(os.path.join(output_dir, '_manifest.json'), 'w') as mf:
+                  json.dump(manifest, mf, indent=2)
+
+              # текстовый список
+              with open(os.path.join(output_dir, '_filelist.txt'), 'w') as fl:
+                  for name, e in sorted(entries.items()):
+                      fl.write(f"{name}\t{e['uncomp_size']}\t{COMPRESSION_NAMES.get(e['compression'], '?')}\n")
+
+              return extracted > 0
+
+          if __name__ == '__main__':
+              import argparse
+              parser = argparse.ArgumentParser(description='UE4 PAK Unpacker')
+              parser.add_argument('mode', choices=['unpack', 'info'])
+              parser.add_argument('-i', '--input', required=True, help='Input PAK file')
+              parser.add_argument('-o', '--output', default='./extracted', help='Output directory')
+              parser.add_argument('-k', '--key', default='', help='AES key (hex)')
+              args = parser.parse_args()
+
+              if args.mode == 'unpack':
+                  success = extract_all(args.input, args.output, args.key)
+                  sys.exit(0 if success else 1)
+              elif args.mode == 'info':
+                  footer_data, magic_off, footer_size = find_footer(args.input)
+                  if footer_data:
+                      parse_footer(footer_data, magic_off)
+                  else:
+                      print("[-] Footer not found")
+                      sys.exit(1)
+          PYEOF
+
+      - name: Run PAK Analysis
+        run: |
+          echo "=========================================="
+          echo "  PAK STRUCTURE ANALYSIS"
+          echo "=========================================="
+          python pak_tool.py info -i "${{ github.event.inputs.pak_file }}"
+
+      - name: Unpack PAK
+        run: |
+          echo "=========================================="
+          echo "  UNPACKING"
+          echo "=========================================="
+          python pak_tool.py unpack \
+            -i "${{ github.event.inputs.pak_file }}" \
+            -o ./extracted \
+            -k "${{ github.event.inputs.aes_key }}"
+
+      - name: Show results
+        if: always()
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "  EXTRACTED FILE STRUCTURE"
+          echo "=========================================="
+
+          if [ -d "./extracted" ]; then
+            echo ""
+            echo "=== Total files ==="
+            find ./extracted -type f ! -name '_*' | wc -l
+            echo ""
+
+            echo "=== Directory tree (top 3 levels) ==="
+            find ./extracted -maxdepth 3 -type d | sort | head -50
+            echo ""
+
+            echo "=== File types distribution ==="
+            find ./extracted -type f ! -name '_*' | sed 's/.*\.//' | sort | uniq -c | sort -rn | head -25
+            echo ""
+
+            echo "=== First 50 files ==="
+            find ./extracted -type f ! -name '_*' | head -50
+            echo ""
+
+            echo "=== Lua files (if any) ==="
+            find ./extracted -name "*.lua" | head -20
+            echo ""
+            
+            echo "=== Config files ==="
+            find ./extracted -name "*.ini" -o -name "*.json" -o -name "*.xml" -o -name "*.cfg" | head -20
+            echo ""
+
+            if [ -f "./extracted/_filelist.txt" ]; then
+              echo "=== File list (first 100) ==="
+              head -100 ./extracted/_filelist.txt
+            fi
+          else
+            echo "[-] No extracted directory created"
+          fi
+
+      - name: Upload extracted content
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extracted-pak-content
+          path: ./extracted/
+          retention-days: 90
+          compression-level: 6
+
+      - name: Upload filelist only (if extraction failed)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pak-diagnostic
+          path: |
+            ./extracted/_manifest.json
+            ./extracted/_filelist.txt
+          retention-days: 90
+          if-no-files-found: ignore
