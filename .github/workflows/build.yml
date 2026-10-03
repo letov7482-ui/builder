@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       pak_file:
-        description: 'Имя PAK файла в корне репозитория'
+        description: 'game_patch_4.6.0.21550.pak'
         required: true
-        default: 'original.pak'
+        default: 'game_patch_4.6.0.21550.pak'
       aes_key:
         description: 'AES ключ (hex, если зашифрован). Оставь пустым если не знаешь'
         required: false
